@@ -1,3 +1,4 @@
-open3d
-numpy
-freenect2
+open3d~=0.18.0
+numpy~=1.25.2
+freenect2~=0.2.3
+psutil~=5.9.4
