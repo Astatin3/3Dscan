@@ -1,133 +1,112 @@
-from freenect2 import Device, FrameType
-import psutil
-
-from PIL import Image
-import open3d as o3d
+from threading import  Thread
+import cv2
 import numpy as np
+import ktb
 
-def depth_to_points(depth_map):
-    height, width = depth_map.shape
-    x_coords, y_coords = np.meshgrid(np.arange(width), np.arange(height))
+import open3d as o3d
 
-    points = np.stack((x_coords, y_coords, depth_map), axis=-1)
-    points = points.reshape(-1, 3)
-
-    return points
-
-def remove_invalid_points(points):
-    mask = points[:, 2] != 0
-    points = points[mask]
-
-    return points, mask
-
-
-def undistort_points(points, params):
-    fx = params.fx
-    fy = params.fy
-    cx = params.cx
-    cy = params.cy
-    k1 = params.k1
-    k2 = params.k2
-    k3 = params.k3
-    p1 = params.p1
-    p2 = params.p2
-
-    # Normalize points
-    x = (points[:, 0] - cx) / fx
-    y = (points[:, 1] - cy) / fy
-
-    # Compute radial distances
-    r2 = x ** 2 + y ** 2
-    r4 = r2 ** 2
-    r6 = r2 ** 3
-
-    # Compute radial distortion
-    radial_distortion = (1 + k1 * r2 + k2 * r4 + k3 * r6)
-
-    # Compute tangential distortion
-    xy = x * y
-    xy2 = 2 * xy
-    x2 = x ** 2
-    y2 = y ** 2
-    tangential_distortion_x = p1 * xy2 + p2 * (r2 + 2 * x2)
-    tangential_distortion_y = p1 * (r2 + 2 * y2) + p2 * xy2
-
-    # Undistort points
-    undistorted_x = (x - tangential_distortion_x) / radial_distortion
-    undistorted_y = (y - tangential_distortion_y) / radial_distortion
-
-    # Reproject points
-    undistorted_points = np.zeros_like(points)
-    undistorted_points[:, 0] = undistorted_x * fx + cx
-    undistorted_points[:, 1] = undistorted_y * fy + cy
-    undistorted_points[:, 2] = points[:, 2]  # Preserve depth values
-
-    return undistorted_points
-
-
-voxel_size = 0.005
+voxel_size = 0.1
+fitness_minimum = 0.9
 
 vis = o3d.visualization.Visualizer()
-vis.create_window(height=480, width=640)
+vis.create_window()
 
 reconstruction = o3d.geometry.PointCloud()
-reconstruction.points = o3d.utility.Vector3dVector(np.random.random((5, 3)))
+reconstruction.points = o3d.utility.Vector3dVector(np.random.rand(2, 3))
+
+
+# vis.add_geometry(pcd)
 vis.add_geometry(reconstruction)
 
-import numpy as np
+def get_pcd(k):
+    points, colors = k.get_ptcld(colorized=True, scale=1000)
 
-threads = []
+    points = points.reshape((-1, 3))
+    colors = colors.reshape((-1, 3))
 
+    colors[:, [0, 2]] = colors[:, [2, 0]]
+
+    points = o3d.utility.Vector3dVector(points)
+    colors = o3d.utility.Vector3dVector(colors)
+
+    pcd = o3d.geometry.PointCloud()
+
+    pcd.points = points
+    pcd.colors = colors
+
+    pcd.points = pcd.voxel_down_sample(voxel_size=voxel_size).points
+
+    return pcd
+
+def calc_transformation(cur_pcd, prev_pcd, cur_fpfh, prev_fpfh):
+    result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        cur_pcd, prev_pcd, cur_fpfh, prev_fpfh,
+        mutual_filter=True,
+        max_correspondence_distance=voxel_size,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+        ransac_n=4, checkers=[],
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(max_iteration=100000, confidence=0.999)
+    )
+    print(result.fitness)
 
 running = True
-device = Device()
 
-color_frame = None
+def run_loop():
+    k = ktb.Kinect()
 
-n_cpus = psutil.cpu_count()
+    prev_pcd = None
+    prev_fpfh = None
+    prev_normals = None
+
+    while running:
+        cur_pcd = get_pcd(k)
+
+        cur_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+
+        cur_fpfh = o3d.pipelines.registration.compute_fpfh_feature(cur_pcd,
+                                                      o3d.geometry.KDTreeSearchParamHybrid(radius=0.25,
+                                                                                                       max_nn=100))
+        if prev_pcd is None:
+            reconstruction.points = cur_pcd.points
+            reconstruction.paint_uniform_color([0.8, 0.8, 0])
+            vis.update_geometry(reconstruction)
+        else:
+            # thread = Thread(target=calc_transformation, args=(cur_pcd, prev_pcd, cur_fpfh, prev_fpfh))
+            # thread.start()
+
+            result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+                cur_pcd, prev_pcd, cur_fpfh, prev_fpfh,
+                mutual_filter=True,
+                max_correspondence_distance=voxel_size,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+                ransac_n=4, checkers=[],
+                criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(max_iteration=100000, confidence=0.999)
+            )
 
 
-with device.running():
-
-    for type_, frame in device:
-
-        if type_ == FrameType.Color:
-            img = frame.to_image()
-            img = img.resize((424,512))
-            color_frame = np.array(img)
-            color_frame = color_frame[:, :, :3]
-            width, height = color_frame.shape[:2]
-            color_frame = color_frame.reshape(width * height, 3)
-
-        elif type_ == FrameType.Depth and \
-            color_frame is not None:
-
-            depth_map = frame.to_array()
-            depth_map /= 5
-            # ir_image /= ir_image.max()
-            # ir_image = np.sqrt(ir_image)
-
-
-            points = depth_to_points(depth_map)
-            points, mask = remove_invalid_points(points)
-            points = undistort_points(points, device.ir_camera_params)
-
-            points /= 512
-
-            reconstruction.points = o3d.utility.Vector3dVector(points)
-            # reconstruction.colors = o3d.utility.Vector3dVector(color_frame[mask])
+            # print(result.transformation)
+            # eg_p2p = o3d.pipelines.registration.registration_icp(
+            #     reconstruction, pcd, threshold, trans_init,
+            #     o3d.pipelines.registration.TransformationEstimationPointToPoint())
+            # if result.fitness > fitness_minimum:
+            reconstruction.points.extend(cur_pcd.transform(-result.transformation).points)
             vis.update_geometry(reconstruction)
 
-        if not vis.poll_events():
-            break
+        prev_pcd = cur_pcd
+        prev_fpfh = cur_fpfh
 
-        vis.update_renderer()
+        print("update")
 
-vis.close()
 
-running = False
+t = Thread(target=run_loop)
+t.start()
 
-print("joining threads...")
+while running:
+    # vis.update_geometry(reconstruction)
+    # print("E")
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        running = False
+    running = vis.poll_events()
+    vis.update_renderer()
 
-for thread in threads:
-    thread.join()
+t.join()
